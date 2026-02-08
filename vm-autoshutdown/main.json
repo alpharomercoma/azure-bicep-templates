@@ -1,0 +1,702 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.40.2.10011",
+      "templateHash": "16818705504905440848"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all resources (default: resource group location)"
+      }
+    },
+    "baseName": {
+      "type": "string",
+      "defaultValue": "autoshutdown",
+      "minLength": 3,
+      "maxLength": 20,
+      "metadata": {
+        "description": "Base name prefix for all resources"
+      }
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "azureuser",
+      "metadata": {
+        "description": "Admin username for the VM"
+      }
+    },
+    "sshPublicKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "SSH public key for VM authentication. Generate with: ssh-keygen -t ed25519"
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_B2s",
+      "metadata": {
+        "description": "VM size. Default Standard_B2s is comparable to AWS t4g.small (2 vCPUs, 4 GiB). If unavailable in your region/subscription, try Standard_D2as_v5, Standard_D2als_v7, or run: az vm list-skus --location <region> --size Standard_B2 --output table"
+      }
+    },
+    "osDiskSizeGb": {
+      "type": "int",
+      "defaultValue": 30,
+      "minValue": 30,
+      "maxValue": 256,
+      "metadata": {
+        "description": "OS disk size in GiB (equivalent to AWS 30 GiB GP3)"
+      }
+    },
+    "autoShutdownTime": {
+      "type": "string",
+      "defaultValue": "2300",
+      "metadata": {
+        "description": "Daily auto-shutdown time in HHmm format (24hr). Safety net beyond inactivity detection."
+      }
+    },
+    "autoShutdownTimezone": {
+      "type": "string",
+      "defaultValue": "Singapore Standard Time",
+      "metadata": {
+        "description": "Timezone for the daily auto-shutdown schedule"
+      }
+    },
+    "notificationEmail": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Email address for CPU idle alert notifications (leave empty to skip)"
+      }
+    }
+  },
+  "variables": {
+    "$fxv#0": "#cloud-config\n# =============================================================================\n# Azure VM Auto-Shutdown Cloud-Init Configuration\n# =============================================================================\n# This cloud-init config implements dual-method inactivity detection:\n#\n# 1. CPU Monitoring (Primary Method):\n#    - Checks CPU utilization every 5 minutes\n#    - Deallocates VM after 3 consecutive idle checks (15 min total)\n#    - CPU threshold: < 5% average utilization\n#\n# 2. SSH Session Detection (Secondary Method):\n#    - Checks for active SSH sessions every 5 minutes\n#    - Deallocates VM after 2 consecutive idle checks (10 min total)\n#\n# Both methods use Azure REST API via Managed Identity to deallocate\n# the VM (stops compute billing), not just OS shutdown.\n# =============================================================================\n\npackage_update: true\npackages:\n  - jq\n  - sysstat\n  - bc\n\nwrite_files:\n  # ==========================================================================\n  # Main idle-detection and self-deallocate script\n  # ==========================================================================\n  - path: /usr/local/bin/check-idle.sh\n    permissions: '0755'\n    content: |\n      #!/bin/bash\n      # ========================================================================\n      # Azure VM Auto-Shutdown: Idle Detection & Self-Deallocate\n      # ========================================================================\n      # This script checks for VM inactivity using two methods:\n      # 1. CPU utilization (< 5% for 15 minutes)\n      # 2. SSH sessions (none for 10 minutes)\n      #\n      # When idle, it deallocates the VM via Azure REST API using the VM's\n      # system-assigned managed identity, ensuring compute billing stops.\n      # ========================================================================\n\n      LOG_FILE=\"/var/log/autoshutdown.log\"\n      CPU_STATE_FILE=\"/var/run/autoshutdown-cpu-idle-count\"\n      SSH_STATE_FILE=\"/var/run/autoshutdown-ssh-idle-count\"\n\n      # Thresholds (matching AWS CDK solution)\n      CPU_THRESHOLD=5          # CPU usage percentage threshold\n      CPU_IDLE_THRESHOLD=3     # Consecutive idle checks before deallocate (3 x 5 min = 15 min)\n      SSH_IDLE_THRESHOLD=2     # Consecutive idle checks before deallocate (2 x 5 min = 10 min)\n\n      # Initialize state files if not exist\n      [ ! -f \"$CPU_STATE_FILE\" ] && echo \"0\" > \"$CPU_STATE_FILE\"\n      [ ! -f \"$SSH_STATE_FILE\" ] && echo \"0\" > \"$SSH_STATE_FILE\"\n\n      # Read current idle counts\n      CPU_IDLE_COUNT=$(cat \"$CPU_STATE_FILE\")\n      SSH_IDLE_COUNT=$(cat \"$SSH_STATE_FILE\")\n\n      # ======================================================================\n      # CPU Utilization Check\n      # ======================================================================\n      # Use mpstat to get 5-second average CPU usage (more accurate than instant)\n      CPU_IDLE_PCT=$(mpstat 5 1 2>/dev/null | tail -1 | awk '{print $NF}')\n      if [ -z \"$CPU_IDLE_PCT\" ]; then\n        # Fallback: parse /proc/stat for CPU usage\n        read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat\n        TOTAL1=$((user + nice + system + idle + iowait + irq + softirq + steal))\n        IDLE1=$idle\n        sleep 2\n        read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat\n        TOTAL2=$((user + nice + system + idle + iowait + irq + softirq + steal))\n        IDLE2=$idle\n        TOTAL_DIFF=$((TOTAL2 - TOTAL1))\n        IDLE_DIFF=$((IDLE2 - IDLE1))\n        if [ \"$TOTAL_DIFF\" -gt 0 ]; then\n          CPU_IDLE_PCT=$(echo \"scale=2; $IDLE_DIFF * 100 / $TOTAL_DIFF\" | bc)\n        else\n          CPU_IDLE_PCT=\"100\"\n        fi\n      fi\n\n      CPU_USAGE=$(echo \"100 - $CPU_IDLE_PCT\" | bc 2>/dev/null || echo \"0\")\n\n      echo \"$(date): CPU usage: ${CPU_USAGE}% (idle: ${CPU_IDLE_PCT}%)\" >> \"$LOG_FILE\"\n\n      # Check if CPU is below threshold\n      IS_CPU_IDLE=$(echo \"$CPU_USAGE < $CPU_THRESHOLD\" | bc -l 2>/dev/null || echo \"0\")\n\n      if [ \"$IS_CPU_IDLE\" -eq 1 ]; then\n        CPU_IDLE_COUNT=$((CPU_IDLE_COUNT + 1))\n        echo \"$CPU_IDLE_COUNT\" > \"$CPU_STATE_FILE\"\n        echo \"$(date): CPU idle. Count incremented to $CPU_IDLE_COUNT/$CPU_IDLE_THRESHOLD\" >> \"$LOG_FILE\"\n      else\n        echo \"0\" > \"$CPU_STATE_FILE\"\n        CPU_IDLE_COUNT=0\n        echo \"$(date): CPU active. Idle count reset.\" >> \"$LOG_FILE\"\n      fi\n\n      # ======================================================================\n      # SSH Session Check\n      # ======================================================================\n      ACTIVE_SESSIONS=$(who 2>/dev/null | grep -c \"pts/\" 2>/dev/null) || ACTIVE_SESSIONS=0\n      echo \"$(date): Active SSH sessions: $ACTIVE_SESSIONS\" >> \"$LOG_FILE\"\n\n      if [ \"$ACTIVE_SESSIONS\" -eq 0 ]; then\n        SSH_IDLE_COUNT=$((SSH_IDLE_COUNT + 1))\n        echo \"$SSH_IDLE_COUNT\" > \"$SSH_STATE_FILE\"\n        echo \"$(date): No SSH sessions. Count incremented to $SSH_IDLE_COUNT/$SSH_IDLE_THRESHOLD\" >> \"$LOG_FILE\"\n      else\n        echo \"0\" > \"$SSH_STATE_FILE\"\n        SSH_IDLE_COUNT=0\n        echo \"$(date): SSH sessions detected. Idle count reset.\" >> \"$LOG_FILE\"\n      fi\n\n      # ======================================================================\n      # Deallocate Decision\n      # ======================================================================\n      SHOULD_DEALLOCATE=0\n      REASON=\"\"\n\n      if [ \"$CPU_IDLE_COUNT\" -ge \"$CPU_IDLE_THRESHOLD\" ]; then\n        SHOULD_DEALLOCATE=1\n        REASON=\"CPU idle for $((CPU_IDLE_COUNT * 5)) minutes (threshold: $((CPU_IDLE_THRESHOLD * 5)) min)\"\n      fi\n\n      if [ \"$SSH_IDLE_COUNT\" -ge \"$SSH_IDLE_THRESHOLD\" ]; then\n        SHOULD_DEALLOCATE=1\n        REASON=\"${REASON:+$REASON; }No SSH sessions for $((SSH_IDLE_COUNT * 5)) minutes (threshold: $((SSH_IDLE_THRESHOLD * 5)) min)\"\n      fi\n\n      if [ \"$SHOULD_DEALLOCATE\" -eq 1 ]; then\n        echo \"$(date): DEALLOCATING VM - Reason: $REASON\" >> \"$LOG_FILE\"\n\n        # Get VM metadata from Azure Instance Metadata Service (IMDS)\n        METADATA=$(curl -s -H \"Metadata: true\" \\\n          \"http://169.254.169.254/metadata/instance?api-version=2021-02-01\")\n\n        SUBSCRIPTION_ID=$(echo \"$METADATA\" | jq -r '.compute.subscriptionId')\n        RESOURCE_GROUP=$(echo \"$METADATA\" | jq -r '.compute.resourceGroupName')\n        VM_NAME=$(echo \"$METADATA\" | jq -r '.compute.name')\n\n        echo \"$(date): VM: $VM_NAME, RG: $RESOURCE_GROUP, Sub: $SUBSCRIPTION_ID\" >> \"$LOG_FILE\"\n\n        # Get access token using system-assigned managed identity\n        TOKEN=$(curl -s -H \"Metadata: true\" \\\n          \"http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/\" \\\n          | jq -r '.access_token')\n\n        if [ -z \"$TOKEN\" ] || [ \"$TOKEN\" = \"null\" ]; then\n          echo \"$(date): ERROR - Failed to obtain access token. Falling back to OS shutdown.\" >> \"$LOG_FILE\"\n          /sbin/shutdown -h now \"Auto-shutdown: $REASON\"\n          exit 1\n        fi\n\n        # Deallocate the VM via Azure REST API\n        # This stops the VM AND releases compute resources (no billing)\n        RESPONSE=$(curl -s -o /dev/null -w \"%{http_code}\" -X POST \\\n          -H \"Authorization: Bearer $TOKEN\" \\\n          -H \"Content-Length: 0\" \\\n          \"https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Compute/virtualMachines/${VM_NAME}/deallocate?api-version=2024-03-01\")\n\n        echo \"$(date): Deallocate API response: HTTP $RESPONSE\" >> \"$LOG_FILE\"\n\n        if [ \"$RESPONSE\" != \"202\" ]; then\n          echo \"$(date): WARNING - Deallocate API returned $RESPONSE. Falling back to OS shutdown.\" >> \"$LOG_FILE\"\n          /sbin/shutdown -h now \"Auto-shutdown: $REASON\"\n        else\n          echo \"$(date): Deallocate request accepted. VM will be stopped and deallocated.\" >> \"$LOG_FILE\"\n        fi\n      fi\n\n  # ==========================================================================\n  # systemd service unit\n  # ==========================================================================\n  - path: /etc/systemd/system/autoshutdown.service\n    content: |\n      [Unit]\n      Description=Check for VM inactivity and deallocate if idle\n\n      [Service]\n      Type=oneshot\n      ExecStart=/usr/local/bin/check-idle.sh\n\n  # ==========================================================================\n  # systemd timer unit - runs every 5 minutes with 10 min grace period\n  # ==========================================================================\n  - path: /etc/systemd/system/autoshutdown.timer\n    content: |\n      [Unit]\n      Description=Run VM inactivity check every 5 minutes\n\n      [Timer]\n      OnBootSec=10min\n      OnUnitActiveSec=5min\n      Unit=autoshutdown.service\n\n      [Install]\n      WantedBy=timers.target\n\nruncmd:\n  # Enable and start the auto-shutdown timer\n  - systemctl daemon-reload\n  - systemctl enable autoshutdown.timer\n  - systemctl start autoshutdown.timer\n  # Initialize log file (YAML-quoted to prevent ': ' from being parsed as mapping)\n  - 'echo \"$(date): Auto-shutdown monitoring initialized\" > /var/log/autoshutdown.log'\n  - 'echo \"$(date): CPU threshold < 5% for 15 minutes (3 checks)\" >> /var/log/autoshutdown.log'\n  - 'echo \"$(date): SSH threshold 0 sessions for 10 minutes (2 checks)\" >> /var/log/autoshutdown.log'\n  - 'echo \"$(date): Check interval 5 minutes\" >> /var/log/autoshutdown.log'\n  - 'echo \"$(date): Grace period 10 minutes after boot\" >> /var/log/autoshutdown.log'\n  - 'echo \"$(date): Action - Deallocate via Azure REST API (stops billing)\" >> /var/log/autoshutdown.log'\n",
+    "vmContributorRoleId": "9980e02c-c2be-4d73-94e8-173b1dc7cf3c",
+    "cloudInitData": "[base64(variables('$fxv#0'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, parameters('baseName'), variables('vmContributorRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.Resources/deployments', format('{0}-vm-deployment', parameters('baseName'))), '2025-04-01').outputs.vmPrincipalId.value]",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('vmContributorRoleId'))]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', format('{0}-vm-deployment', parameters('baseName')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "[format('{0}-network-deployment', parameters('baseName'))]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "baseName": {
+            "value": "[parameters('baseName')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.40.2.10011",
+              "templateHash": "1437296073487241949"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Azure region for all resources"
+              }
+            },
+            "baseName": {
+              "type": "string",
+              "metadata": {
+                "description": "Base name for all resources"
+              }
+            },
+            "vnetAddressPrefix": {
+              "type": "string",
+              "defaultValue": "10.0.0.0/16",
+              "metadata": {
+                "description": "VNet address prefix"
+              }
+            },
+            "subnetAddressPrefix": {
+              "type": "string",
+              "defaultValue": "10.0.1.0/24",
+              "metadata": {
+                "description": "Subnet address prefix"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/networkSecurityGroups",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}-nsg', parameters('baseName'))]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "securityRules": [
+                  {
+                    "name": "AllowSSH",
+                    "properties": {
+                      "priority": 1000,
+                      "direction": "Inbound",
+                      "access": "Allow",
+                      "protocol": "Tcp",
+                      "sourcePortRange": "*",
+                      "destinationPortRange": "22",
+                      "sourceAddressPrefix": "*",
+                      "destinationAddressPrefix": "*"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "type": "Microsoft.Network/virtualNetworks",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}-vnet', parameters('baseName'))]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "addressSpace": {
+                  "addressPrefixes": [
+                    "[parameters('vnetAddressPrefix')]"
+                  ]
+                },
+                "subnets": [
+                  {
+                    "name": "default",
+                    "properties": {
+                      "addressPrefix": "[parameters('subnetAddressPrefix')]",
+                      "networkSecurityGroup": {
+                        "id": "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nsg', parameters('baseName')))]"
+                      }
+                    }
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nsg', parameters('baseName')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Network/publicIPAddresses",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}-pip', parameters('baseName'))]",
+              "location": "[parameters('location')]",
+              "sku": {
+                "name": "Standard"
+              },
+              "properties": {
+                "publicIPAllocationMethod": "Static",
+                "publicIPAddressVersion": "IPv4"
+              }
+            },
+            {
+              "type": "Microsoft.Network/networkInterfaces",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}-nic', parameters('baseName'))]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "ipConfigurations": [
+                  {
+                    "name": "ipconfig1",
+                    "properties": {
+                      "privateIPAllocationMethod": "Dynamic",
+                      "publicIPAddress": {
+                        "id": "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('baseName')))]"
+                      },
+                      "subnet": {
+                        "id": "[reference(resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('baseName'))), '2024-01-01').subnets[0].id]"
+                      }
+                    }
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('baseName')))]",
+                "[resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('baseName')))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "nicId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-nic', parameters('baseName')))]"
+            },
+            "publicIpAddress": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('baseName'))), '2024-01-01').ipAddress]"
+            },
+            "publicIpId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('baseName')))]"
+            },
+            "vnetName": {
+              "type": "string",
+              "value": "[format('{0}-vnet', parameters('baseName'))]"
+            },
+            "subnetId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('baseName'))), '2024-01-01').subnets[0].id]"
+            },
+            "nsgName": {
+              "type": "string",
+              "value": "[format('{0}-nsg', parameters('baseName'))]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "[format('{0}-vm-deployment', parameters('baseName'))]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "baseName": {
+            "value": "[parameters('baseName')]"
+          },
+          "adminUsername": {
+            "value": "[parameters('adminUsername')]"
+          },
+          "sshPublicKey": {
+            "value": "[parameters('sshPublicKey')]"
+          },
+          "nicId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', format('{0}-network-deployment', parameters('baseName'))), '2025-04-01').outputs.nicId.value]"
+          },
+          "vmSize": {
+            "value": "[parameters('vmSize')]"
+          },
+          "osDiskSizeGb": {
+            "value": "[parameters('osDiskSizeGb')]"
+          },
+          "autoShutdownTime": {
+            "value": "[parameters('autoShutdownTime')]"
+          },
+          "autoShutdownTimezone": {
+            "value": "[parameters('autoShutdownTimezone')]"
+          },
+          "cloudInitData": {
+            "value": "[variables('cloudInitData')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.40.2.10011",
+              "templateHash": "6745755770158170451"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Azure region for all resources"
+              }
+            },
+            "baseName": {
+              "type": "string",
+              "metadata": {
+                "description": "Base name for all resources"
+              }
+            },
+            "adminUsername": {
+              "type": "string",
+              "metadata": {
+                "description": "Admin username for the VM"
+              }
+            },
+            "sshPublicKey": {
+              "type": "securestring",
+              "metadata": {
+                "description": "SSH public key for authentication"
+              }
+            },
+            "nicId": {
+              "type": "string",
+              "metadata": {
+                "description": "Network interface ID"
+              }
+            },
+            "vmSize": {
+              "type": "string",
+              "defaultValue": "Standard_B2s",
+              "metadata": {
+                "description": "VM size (equivalent to AWS t4g.small)"
+              }
+            },
+            "osDiskSizeGb": {
+              "type": "int",
+              "defaultValue": 30,
+              "metadata": {
+                "description": "OS disk size in GiB"
+              }
+            },
+            "autoShutdownTime": {
+              "type": "string",
+              "defaultValue": "2300",
+              "metadata": {
+                "description": "Daily auto-shutdown time (HHmm format, 24hr)"
+              }
+            },
+            "autoShutdownTimezone": {
+              "type": "string",
+              "defaultValue": "Singapore Standard Time",
+              "metadata": {
+                "description": "Timezone for auto-shutdown schedule"
+              }
+            },
+            "cloudInitData": {
+              "type": "string",
+              "metadata": {
+                "description": "Cloud-init custom data (base64 encoded)"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Compute/virtualMachines",
+              "apiVersion": "2024-03-01",
+              "name": "[format('{0}-vm', parameters('baseName'))]",
+              "location": "[parameters('location')]",
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "hardwareProfile": {
+                  "vmSize": "[parameters('vmSize')]"
+                },
+                "osProfile": {
+                  "computerName": "[format('{0}-vm', parameters('baseName'))]",
+                  "adminUsername": "[parameters('adminUsername')]",
+                  "customData": "[parameters('cloudInitData')]",
+                  "linuxConfiguration": {
+                    "disablePasswordAuthentication": true,
+                    "ssh": {
+                      "publicKeys": [
+                        {
+                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                          "keyData": "[parameters('sshPublicKey')]"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "storageProfile": {
+                  "imageReference": {
+                    "publisher": "Canonical",
+                    "offer": "ubuntu-24_04-lts",
+                    "sku": "server",
+                    "version": "latest"
+                  },
+                  "osDisk": {
+                    "name": "[format('{0}-osdisk', parameters('baseName'))]",
+                    "createOption": "FromImage",
+                    "diskSizeGB": "[parameters('osDiskSizeGb')]",
+                    "managedDisk": {
+                      "storageAccountType": "Premium_LRS"
+                    },
+                    "deleteOption": "Delete"
+                  }
+                },
+                "networkProfile": {
+                  "networkInterfaces": [
+                    {
+                      "id": "[parameters('nicId')]",
+                      "properties": {
+                        "deleteOption": "Delete"
+                      }
+                    }
+                  ]
+                },
+                "securityProfile": {
+                  "securityType": "TrustedLaunch",
+                  "uefiSettings": {
+                    "secureBootEnabled": true,
+                    "vTpmEnabled": true
+                  }
+                },
+                "diagnosticsProfile": {
+                  "bootDiagnostics": {
+                    "enabled": true
+                  }
+                }
+              }
+            },
+            {
+              "type": "Microsoft.DevTestLab/schedules",
+              "apiVersion": "2018-09-15",
+              "name": "[format('shutdown-computevm-{0}', format('{0}-vm', parameters('baseName')))]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "status": "Enabled",
+                "taskType": "ComputeVmShutdownTask",
+                "dailyRecurrence": {
+                  "time": "[parameters('autoShutdownTime')]"
+                },
+                "timeZoneId": "[parameters('autoShutdownTimezone')]",
+                "targetResourceId": "[resourceId('Microsoft.Compute/virtualMachines', format('{0}-vm', parameters('baseName')))]",
+                "notificationSettings": {
+                  "status": "Disabled"
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Compute/virtualMachines', format('{0}-vm', parameters('baseName')))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "vmId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Compute/virtualMachines', format('{0}-vm', parameters('baseName')))]"
+            },
+            "vmName": {
+              "type": "string",
+              "value": "[format('{0}-vm', parameters('baseName'))]"
+            },
+            "vmPrincipalId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', format('{0}-vm', parameters('baseName'))), '2024-03-01', 'full').identity.principalId]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', format('{0}-network-deployment', parameters('baseName')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "[format('{0}-monitoring-deployment', parameters('baseName'))]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "baseName": {
+            "value": "[parameters('baseName')]"
+          },
+          "vmResourceId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', format('{0}-vm-deployment', parameters('baseName'))), '2025-04-01').outputs.vmId.value]"
+          },
+          "notificationEmail": {
+            "value": "[parameters('notificationEmail')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.40.2.10011",
+              "templateHash": "8481700659067050595"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Azure region for all resources"
+              }
+            },
+            "baseName": {
+              "type": "string",
+              "metadata": {
+                "description": "Base name for all resources"
+              }
+            },
+            "vmResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "VM resource ID to monitor"
+              }
+            },
+            "notificationEmail": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "Email address for alert notifications (optional)"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Insights/actionGroups",
+              "apiVersion": "2023-01-01",
+              "name": "[format('{0}-ag', parameters('baseName'))]",
+              "location": "global",
+              "properties": {
+                "groupShortName": "VMIdle",
+                "enabled": true,
+                "emailReceivers": "[if(not(empty(parameters('notificationEmail'))), createArray(createObject('name', 'AdminEmail', 'emailAddress', parameters('notificationEmail'), 'useCommonAlertSchema', true())), createArray())]"
+              }
+            },
+            {
+              "type": "Microsoft.Insights/metricAlerts",
+              "apiVersion": "2018-03-01",
+              "name": "[format('{0}-cpu-idle-alert', parameters('baseName'))]",
+              "location": "global",
+              "properties": {
+                "description": "Alert when VM CPU utilization is below 5% for 15 minutes (inactivity detected). The VM will self-deallocate via its cloud-init monitoring script.",
+                "severity": 2,
+                "enabled": true,
+                "scopes": [
+                  "[parameters('vmResourceId')]"
+                ],
+                "evaluationFrequency": "PT5M",
+                "windowSize": "PT15M",
+                "criteria": {
+                  "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria",
+                  "allOf": [
+                    {
+                      "name": "CPUIdle",
+                      "metricNamespace": "Microsoft.Compute/virtualMachines",
+                      "metricName": "Percentage CPU",
+                      "operator": "LessThan",
+                      "threshold": 5,
+                      "timeAggregation": "Average",
+                      "criterionType": "StaticThresholdCriterion"
+                    }
+                  ]
+                },
+                "actions": [
+                  {
+                    "actionGroupId": "[resourceId('Microsoft.Insights/actionGroups', format('{0}-ag', parameters('baseName')))]"
+                  }
+                ],
+                "autoMitigate": true,
+                "targetResourceType": "Microsoft.Compute/virtualMachines",
+                "targetResourceRegion": "[parameters('location')]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Insights/actionGroups', format('{0}-ag', parameters('baseName')))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "actionGroupId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Insights/actionGroups', format('{0}-ag', parameters('baseName')))]"
+            },
+            "alertId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Insights/metricAlerts', format('{0}-cpu-idle-alert', parameters('baseName')))]"
+            },
+            "alertName": {
+              "type": "string",
+              "value": "[format('{0}-cpu-idle-alert', parameters('baseName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', format('{0}-vm-deployment', parameters('baseName')))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "vmId": {
+      "type": "string",
+      "metadata": {
+        "description": "VM resource ID"
+      },
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', format('{0}-vm-deployment', parameters('baseName'))), '2025-04-01').outputs.vmId.value]"
+    },
+    "vmName": {
+      "type": "string",
+      "metadata": {
+        "description": "VM name"
+      },
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', format('{0}-vm-deployment', parameters('baseName'))), '2025-04-01').outputs.vmName.value]"
+    },
+    "publicIpAddress": {
+      "type": "string",
+      "metadata": {
+        "description": "VM public IP address"
+      },
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', format('{0}-network-deployment', parameters('baseName'))), '2025-04-01').outputs.publicIpAddress.value]"
+    },
+    "sshCommand": {
+      "type": "string",
+      "metadata": {
+        "description": "SSH command to connect to the VM"
+      },
+      "value": "[format('ssh {0}@{1}', parameters('adminUsername'), reference(resourceId('Microsoft.Resources/deployments', format('{0}-network-deployment', parameters('baseName'))), '2025-04-01').outputs.publicIpAddress.value)]"
+    },
+    "startVmCommand": {
+      "type": "string",
+      "metadata": {
+        "description": "Command to start the VM after it has been deallocated"
+      },
+      "value": "[format('az vm start --resource-group {0} --name {1}', resourceGroup().name, reference(resourceId('Microsoft.Resources/deployments', format('{0}-vm-deployment', parameters('baseName'))), '2025-04-01').outputs.vmName.value)]"
+    },
+    "vmStatusCommand": {
+      "type": "string",
+      "metadata": {
+        "description": "Command to check VM status"
+      },
+      "value": "[format('az vm get-instance-view --resource-group {0} --name {1} --query instanceView.statuses[1].displayStatus -o tsv', resourceGroup().name, reference(resourceId('Microsoft.Resources/deployments', format('{0}-vm-deployment', parameters('baseName'))), '2025-04-01').outputs.vmName.value)]"
+    },
+    "alertName": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure Monitor alert name"
+      },
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', format('{0}-monitoring-deployment', parameters('baseName'))), '2025-04-01').outputs.alertName.value]"
+    },
+    "resourceGroupName": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource group name"
+      },
+      "value": "[resourceGroup().name]"
+    },
+    "region": {
+      "type": "string",
+      "metadata": {
+        "description": "Deployment region"
+      },
+      "value": "[parameters('location')]"
+    }
+  }
+}

@@ -1,0 +1,214 @@
+#cloud-config
+# =============================================================================
+# Azure VM Auto-Shutdown Cloud-Init Configuration
+# =============================================================================
+# This cloud-init config implements dual-method inactivity detection:
+#
+# 1. CPU Monitoring (Primary Method):
+#    - Checks CPU utilization every 5 minutes
+#    - Deallocates VM after 3 consecutive idle checks (15 min total)
+#    - CPU threshold: < 5% average utilization
+#
+# 2. SSH Session Detection (Secondary Method):
+#    - Checks for active SSH sessions every 5 minutes
+#    - Deallocates VM after 2 consecutive idle checks (10 min total)
+#
+# Both methods use Azure REST API via Managed Identity to deallocate
+# the VM (stops compute billing), not just OS shutdown.
+# =============================================================================
+
+package_update: true
+packages:
+  - jq
+  - sysstat
+  - bc
+
+write_files:
+  # ==========================================================================
+  # Main idle-detection and self-deallocate script
+  # ==========================================================================
+  - path: /usr/local/bin/check-idle.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # ========================================================================
+      # Azure VM Auto-Shutdown: Idle Detection & Self-Deallocate
+      # ========================================================================
+      # This script checks for VM inactivity using two methods:
+      # 1. CPU utilization (< 5% for 15 minutes)
+      # 2. SSH sessions (none for 10 minutes)
+      #
+      # When idle, it deallocates the VM via Azure REST API using the VM's
+      # system-assigned managed identity, ensuring compute billing stops.
+      # ========================================================================
+
+      LOG_FILE="/var/log/autoshutdown.log"
+      CPU_STATE_FILE="/var/run/autoshutdown-cpu-idle-count"
+      SSH_STATE_FILE="/var/run/autoshutdown-ssh-idle-count"
+
+      # Thresholds (matching AWS CDK solution)
+      CPU_THRESHOLD=5          # CPU usage percentage threshold
+      CPU_IDLE_THRESHOLD=3     # Consecutive idle checks before deallocate (3 x 5 min = 15 min)
+      SSH_IDLE_THRESHOLD=2     # Consecutive idle checks before deallocate (2 x 5 min = 10 min)
+
+      # Initialize state files if not exist
+      [ ! -f "$CPU_STATE_FILE" ] && echo "0" > "$CPU_STATE_FILE"
+      [ ! -f "$SSH_STATE_FILE" ] && echo "0" > "$SSH_STATE_FILE"
+
+      # Read current idle counts
+      CPU_IDLE_COUNT=$(cat "$CPU_STATE_FILE")
+      SSH_IDLE_COUNT=$(cat "$SSH_STATE_FILE")
+
+      # ======================================================================
+      # CPU Utilization Check
+      # ======================================================================
+      # Use mpstat to get 5-second average CPU usage (more accurate than instant)
+      CPU_IDLE_PCT=$(mpstat 5 1 2>/dev/null | tail -1 | awk '{print $NF}')
+      if [ -z "$CPU_IDLE_PCT" ]; then
+        # Fallback: parse /proc/stat for CPU usage
+        read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+        TOTAL1=$((user + nice + system + idle + iowait + irq + softirq + steal))
+        IDLE1=$idle
+        sleep 2
+        read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+        TOTAL2=$((user + nice + system + idle + iowait + irq + softirq + steal))
+        IDLE2=$idle
+        TOTAL_DIFF=$((TOTAL2 - TOTAL1))
+        IDLE_DIFF=$((IDLE2 - IDLE1))
+        if [ "$TOTAL_DIFF" -gt 0 ]; then
+          CPU_IDLE_PCT=$(echo "scale=2; $IDLE_DIFF * 100 / $TOTAL_DIFF" | bc)
+        else
+          CPU_IDLE_PCT="100"
+        fi
+      fi
+
+      CPU_USAGE=$(echo "100 - $CPU_IDLE_PCT" | bc 2>/dev/null || echo "0")
+
+      echo "$(date): CPU usage: ${CPU_USAGE}% (idle: ${CPU_IDLE_PCT}%)" >> "$LOG_FILE"
+
+      # Check if CPU is below threshold
+      IS_CPU_IDLE=$(echo "$CPU_USAGE < $CPU_THRESHOLD" | bc -l 2>/dev/null || echo "0")
+
+      if [ "$IS_CPU_IDLE" -eq 1 ]; then
+        CPU_IDLE_COUNT=$((CPU_IDLE_COUNT + 1))
+        echo "$CPU_IDLE_COUNT" > "$CPU_STATE_FILE"
+        echo "$(date): CPU idle. Count incremented to $CPU_IDLE_COUNT/$CPU_IDLE_THRESHOLD" >> "$LOG_FILE"
+      else
+        echo "0" > "$CPU_STATE_FILE"
+        CPU_IDLE_COUNT=0
+        echo "$(date): CPU active. Idle count reset." >> "$LOG_FILE"
+      fi
+
+      # ======================================================================
+      # SSH Session Check
+      # ======================================================================
+      ACTIVE_SESSIONS=$(who 2>/dev/null | grep -c "pts/" 2>/dev/null) || ACTIVE_SESSIONS=0
+      echo "$(date): Active SSH sessions: $ACTIVE_SESSIONS" >> "$LOG_FILE"
+
+      if [ "$ACTIVE_SESSIONS" -eq 0 ]; then
+        SSH_IDLE_COUNT=$((SSH_IDLE_COUNT + 1))
+        echo "$SSH_IDLE_COUNT" > "$SSH_STATE_FILE"
+        echo "$(date): No SSH sessions. Count incremented to $SSH_IDLE_COUNT/$SSH_IDLE_THRESHOLD" >> "$LOG_FILE"
+      else
+        echo "0" > "$SSH_STATE_FILE"
+        SSH_IDLE_COUNT=0
+        echo "$(date): SSH sessions detected. Idle count reset." >> "$LOG_FILE"
+      fi
+
+      # ======================================================================
+      # Deallocate Decision
+      # ======================================================================
+      SHOULD_DEALLOCATE=0
+      REASON=""
+
+      if [ "$CPU_IDLE_COUNT" -ge "$CPU_IDLE_THRESHOLD" ]; then
+        SHOULD_DEALLOCATE=1
+        REASON="CPU idle for $((CPU_IDLE_COUNT * 5)) minutes (threshold: $((CPU_IDLE_THRESHOLD * 5)) min)"
+      fi
+
+      if [ "$SSH_IDLE_COUNT" -ge "$SSH_IDLE_THRESHOLD" ]; then
+        SHOULD_DEALLOCATE=1
+        REASON="${REASON:+$REASON; }No SSH sessions for $((SSH_IDLE_COUNT * 5)) minutes (threshold: $((SSH_IDLE_THRESHOLD * 5)) min)"
+      fi
+
+      if [ "$SHOULD_DEALLOCATE" -eq 1 ]; then
+        echo "$(date): DEALLOCATING VM - Reason: $REASON" >> "$LOG_FILE"
+
+        # Get VM metadata from Azure Instance Metadata Service (IMDS)
+        METADATA=$(curl -s -H "Metadata: true" \
+          "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+
+        SUBSCRIPTION_ID=$(echo "$METADATA" | jq -r '.compute.subscriptionId')
+        RESOURCE_GROUP=$(echo "$METADATA" | jq -r '.compute.resourceGroupName')
+        VM_NAME=$(echo "$METADATA" | jq -r '.compute.name')
+
+        echo "$(date): VM: $VM_NAME, RG: $RESOURCE_GROUP, Sub: $SUBSCRIPTION_ID" >> "$LOG_FILE"
+
+        # Get access token using system-assigned managed identity
+        TOKEN=$(curl -s -H "Metadata: true" \
+          "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" \
+          | jq -r '.access_token')
+
+        if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+          echo "$(date): ERROR - Failed to obtain access token. Falling back to OS shutdown." >> "$LOG_FILE"
+          /sbin/shutdown -h now "Auto-shutdown: $REASON"
+          exit 1
+        fi
+
+        # Deallocate the VM via Azure REST API
+        # This stops the VM AND releases compute resources (no billing)
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Length: 0" \
+          "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Compute/virtualMachines/${VM_NAME}/deallocate?api-version=2024-03-01")
+
+        echo "$(date): Deallocate API response: HTTP $RESPONSE" >> "$LOG_FILE"
+
+        if [ "$RESPONSE" != "202" ]; then
+          echo "$(date): WARNING - Deallocate API returned $RESPONSE. Falling back to OS shutdown." >> "$LOG_FILE"
+          /sbin/shutdown -h now "Auto-shutdown: $REASON"
+        else
+          echo "$(date): Deallocate request accepted. VM will be stopped and deallocated." >> "$LOG_FILE"
+        fi
+      fi
+
+  # ==========================================================================
+  # systemd service unit
+  # ==========================================================================
+  - path: /etc/systemd/system/autoshutdown.service
+    content: |
+      [Unit]
+      Description=Check for VM inactivity and deallocate if idle
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/check-idle.sh
+
+  # ==========================================================================
+  # systemd timer unit - runs every 5 minutes with 10 min grace period
+  # ==========================================================================
+  - path: /etc/systemd/system/autoshutdown.timer
+    content: |
+      [Unit]
+      Description=Run VM inactivity check every 5 minutes
+
+      [Timer]
+      OnBootSec=10min
+      OnUnitActiveSec=5min
+      Unit=autoshutdown.service
+
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  # Enable and start the auto-shutdown timer
+  - systemctl daemon-reload
+  - systemctl enable autoshutdown.timer
+  - systemctl start autoshutdown.timer
+  # Initialize log file (YAML-quoted to prevent ': ' from being parsed as mapping)
+  - 'echo "$(date): Auto-shutdown monitoring initialized" > /var/log/autoshutdown.log'
+  - 'echo "$(date): CPU threshold < 5% for 15 minutes (3 checks)" >> /var/log/autoshutdown.log'
+  - 'echo "$(date): SSH threshold 0 sessions for 10 minutes (2 checks)" >> /var/log/autoshutdown.log'
+  - 'echo "$(date): Check interval 5 minutes" >> /var/log/autoshutdown.log'
+  - 'echo "$(date): Grace period 10 minutes after boot" >> /var/log/autoshutdown.log'
+  - 'echo "$(date): Action - Deallocate via Azure REST API (stops billing)" >> /var/log/autoshutdown.log'
