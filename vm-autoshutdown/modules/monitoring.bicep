@@ -1,10 +1,7 @@
 // =============================================================================
 // Monitoring Module - Azure Monitor Metric Alert & Action Group
 // =============================================================================
-// Equivalent to AWS CloudWatch Alarm with EC2 Stop Action
-//
-// In AWS, CloudWatch directly stops the EC2 instance via alarm action.
-// In Azure, the VM self-deallocates via REST API (handled by cloud-init).
+// The VM self-deallocates via REST API (handled by cloud-init).
 // This metric alert provides cloud-level visibility and email notifications
 // as an additional monitoring layer.
 // =============================================================================
@@ -22,7 +19,7 @@ param vmResourceId string
 param notificationEmail string = ''
 
 // =============================================================================
-// Action Group (equivalent to CloudWatch Alarm action target)
+// Action Group
 // =============================================================================
 resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
   name: '${baseName}-ag'
@@ -43,13 +40,7 @@ resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
 // =============================================================================
 // Metric Alert - CPU Idle Detection
 // =============================================================================
-// Equivalent to AWS CloudWatch Alarm:
-//   - Metric: CPUUtilization < 5%
-//   - Period: 5 minutes
-//   - Evaluation periods: 3
-//   - Total detection time: 15 minutes
-//
-// Azure Metric Alert configuration:
+// Configuration:
 //   - Metric: Percentage CPU < 5%
 //   - Aggregation: Average
 //   - Window size: 15 minutes
@@ -65,8 +56,8 @@ resource cpuIdleAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
     scopes: [
       vmResourceId
     ]
-    evaluationFrequency: 'PT5M'   // Check every 5 minutes (matches AWS 5-min period)
-    windowSize: 'PT15M'           // 15-minute window (matches AWS 3 x 5-min periods)
+    evaluationFrequency: 'PT5M'   // Check every 5 minutes
+    windowSize: 'PT15M'           // 15-minute window
     criteria: {
       'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
       allOf: [

@@ -1,8 +1,6 @@
 // =============================================================================
 // Network Module - VNet, Subnet, NSG, Public IP, NIC
 // =============================================================================
-// Equivalent to AWS VPC + Security Group + Elastic IP
-// =============================================================================
 
 @description('Azure region for all resources')
 param location string
@@ -17,7 +15,7 @@ param vnetAddressPrefix string = '10.0.0.0/16'
 param subnetAddressPrefix string = '10.0.1.0/24'
 
 // =============================================================================
-// Network Security Group (equivalent to AWS Security Group)
+// Network Security Group
 // =============================================================================
 resource nsg 'Microsoft.Network/networkSecurityGroups@2024-01-01' = {
   name: '${baseName}-nsg'
@@ -42,7 +40,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-01-01' = {
 }
 
 // =============================================================================
-// Virtual Network (equivalent to AWS VPC)
+// Virtual Network
 // =============================================================================
 resource vnet 'Microsoft.Network/virtualNetworks@2024-01-01' = {
   name: '${baseName}-vnet'
@@ -68,7 +66,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-01-01' = {
 }
 
 // =============================================================================
-// Public IP Address (equivalent to AWS Elastic IP)
+// Public IP Address
 // =============================================================================
 resource publicIp 'Microsoft.Network/publicIPAddresses@2024-01-01' = {
   name: '${baseName}-pip'
@@ -83,7 +81,7 @@ resource publicIp 'Microsoft.Network/publicIPAddresses@2024-01-01' = {
 }
 
 // =============================================================================
-// Network Interface (equivalent to AWS ENI, auto-created in EC2)
+// Network Interface
 // =============================================================================
 resource nic 'Microsoft.Network/networkInterfaces@2024-01-01' = {
   name: '${baseName}-nic'

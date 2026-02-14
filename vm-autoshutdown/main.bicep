@@ -1,11 +1,9 @@
 // =============================================================================
 // Azure VM Auto-Shutdown - Main Deployment Template
 // =============================================================================
-// Equivalent to: aws-cdk-templates/ec2-autoshutdown
 //
 // This Bicep template deploys an Azure VM with automatic shutdown based on
-// inactivity detection, using the same dual-method approach as the AWS CDK
-// solution:
+// inactivity detection, using a dual-method approach:
 //
 // 1. CPU Monitoring (Primary):
 //    - Checks CPU utilization every 5 minutes
@@ -14,16 +12,6 @@
 // 2. SSH Session Detection (Secondary):
 //    - Checks for active SSH sessions every 5 minutes
 //    - Deallocates VM after 2 consecutive idle checks (10 min, 0 sessions)
-//
-// AWS → Azure Service Mapping:
-//   VPC                    → Virtual Network (VNet)
-//   Security Group         → Network Security Group (NSG)
-//   EC2 Instance (t4g.small) → Azure VM (Standard_B2s)
-//   IAM Instance Role      → System-Assigned Managed Identity
-//   CloudWatch Alarm       → Azure Monitor Metric Alert
-//   User Data              → Cloud-Init (customData)
-//   SSM Parameter Store    → SSH Public Key (parameter)
-//   CloudWatch Stop Action → Self-deallocate via Azure REST API
 // =============================================================================
 
 targetScope = 'resourceGroup'
@@ -47,10 +35,10 @@ param adminUsername string = 'azureuser'
 @secure()
 param sshPublicKey string
 
-@description('VM size. Default Standard_B2s is comparable to AWS t4g.small (2 vCPUs, 4 GiB). If unavailable in your region/subscription, try Standard_D2as_v5, Standard_D2als_v7, or run: az vm list-skus --location <region> --size Standard_B2 --output table')
+@description('VM size. Default Standard_B2s provides 2 vCPUs and 4 GiB RAM. If unavailable in your region/subscription, try Standard_D2as_v5, Standard_D2als_v7, or run: az vm list-skus --location <region> --size Standard_B2 --output table')
 param vmSize string = 'Standard_B2s'
 
-@description('OS disk size in GiB (equivalent to AWS 30 GiB GP3)')
+@description('OS disk size in GiB')
 @minValue(30)
 @maxValue(256)
 param osDiskSizeGb int = 30
@@ -112,7 +100,7 @@ module vm 'modules/vm.bicep' = {
 // Contributor role, scoped to the resource group. This allows the cloud-init
 // script to call the Azure REST API to deallocate the VM when idle.
 //
-// Equivalent to the AWS IAM Role attached to the EC2 instance.
+
 resource vmContributorRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(resourceGroup().id, baseName, vmContributorRoleId)
   properties: {

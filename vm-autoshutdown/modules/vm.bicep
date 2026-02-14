@@ -1,8 +1,6 @@
 // =============================================================================
 // VM Module - Virtual Machine with Cloud-Init & Auto-Shutdown Schedule
 // =============================================================================
-// Equivalent to AWS EC2 Instance (t4g.small) with User Data
-// =============================================================================
 
 @description('Azure region for all resources')
 param location string
@@ -20,7 +18,7 @@ param sshPublicKey string
 @description('Network interface ID')
 param nicId string
 
-@description('VM size (equivalent to AWS t4g.small)')
+@description('VM size (default: Standard_B2s — 2 vCPUs, 4 GiB RAM)')
 param vmSize string = 'Standard_B2s'
 
 @description('OS disk size in GiB')
@@ -36,19 +34,19 @@ param autoShutdownTimezone string = 'Singapore Standard Time'
 param cloudInitData string
 
 // =============================================================================
-// Virtual Machine (equivalent to AWS EC2 Instance)
+// Virtual Machine
 // =============================================================================
 resource vm 'Microsoft.Compute/virtualMachines@2024-03-01' = {
   name: '${baseName}-vm'
   location: location
   identity: {
-    // System-assigned managed identity (equivalent to AWS IAM Instance Role)
+    // System-assigned managed identity
     // Used by the VM to call Azure REST API for self-deallocation
     type: 'SystemAssigned'
   }
   properties: {
     hardwareProfile: {
-      // Standard_B2s: 2 vCPUs, 4 GiB RAM (comparable to AWS t4g.small)
+      // Standard_B2s: 2 vCPUs, 4 GiB RAM
       vmSize: vmSize
     }
     osProfile: {
@@ -68,7 +66,7 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-03-01' = {
       }
     }
     storageProfile: {
-      // Ubuntu 24.04 LTS (equivalent to Ubuntu 24.04 ARM64 on AWS)
+      // Ubuntu 24.04 LTS
       imageReference: {
         publisher: 'Canonical'
         offer: 'ubuntu-24_04-lts'
@@ -80,7 +78,7 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-03-01' = {
         createOption: 'FromImage'
         diskSizeGB: osDiskSizeGb
         managedDisk: {
-          // Premium SSD (equivalent to AWS GP3)
+          // Premium SSD
           storageAccountType: 'Premium_LRS'
         }
         deleteOption: 'Delete'
@@ -117,8 +115,7 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-03-01' = {
 // =============================================================================
 // Auto-Shutdown Schedule (Azure-native daily shutdown safety net)
 // =============================================================================
-// This is an Azure-specific feature with no direct AWS equivalent.
-// It provides a daily time-based auto-shutdown as an additional safety net
+// Provides a daily time-based auto-shutdown as an additional safety net
 // on top of the inactivity-based detection.
 resource autoShutdownSchedule 'Microsoft.DevTestLab/schedules@2018-09-15' = {
   name: 'shutdown-computevm-${vm.name}'
