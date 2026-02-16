@@ -1,62 +1,43 @@
 # Azure Bicep Templates
 
-Collection of Azure infrastructure templates using Bicep (Azure's domain-specific IaC language).
+Azure infrastructure templates using Bicep.
 
----
-
-## Available Templates
+## Templates
 
 ### [vm-autoshutdown](./vm-autoshutdown)
-Azure VM with **triple automatic shutdown mechanisms** — CPU monitoring, SSH session detection, and a daily DevTest Lab schedule — to prevent idle instances from accruing costs.
 
-- **Instance:** Standard_B2s (2 vCPUs, 4 GiB RAM) · Ubuntu 24.04 LTS · 30 GiB Premium SSD
-- **Region:** Southeast Asia (Singapore)
-- **Shutdown:** CPU < 5% for 15 min + no SSH for 10 min + daily 11 PM schedule
-- **Cost:** ~$46.64/mo (running 24/7) — significantly less with auto-shutdown
+Azure VM with automatic shutdown on inactivity (CPU monitoring + SSH session detection + DevTest Lab schedule).
 
----
+| Property | Value |
+|----------|-------|
+| Instance | Standard_B2s (2 vCPUs, 4 GiB) |
+| OS | Ubuntu 24.04 LTS |
+| Region | southeastasia (Singapore) |
+| Storage | 30 GiB Premium SSD |
+| Cost | ~$47/mo (running 24/7) |
 
 ## Quick Start
 
 ```bash
-# Navigate to template
 cd <template-name>
-
-# Deploy
-./deploy.sh
-
-# Validate only
-./deploy.sh --validate
-
-# Preview changes
-./deploy.sh --what-if
-
-# Delete everything
-./deploy.sh --delete
+./deploy.sh              # deploy
+./deploy.sh --validate   # validate only
+./deploy.sh --what-if    # preview changes
+./deploy.sh --delete     # delete everything
 ```
 
 ## Prerequisites
 
 - [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli) with Bicep (`az bicep install`)
 - Azure subscription with appropriate permissions
-- SSH key pair for VM access
+- SSH key pair (`ssh-keygen -t ed25519`)
 
-## Authentication
+## Helper Scripts
 
-```bash
-# Interactive login
-az login
-
-# Service Principal
-az login --service-principal -u <app-id> -p <password> --tenant <tenant-id>
-
-# Managed Identity (from Azure VM/Container)
-az login --identity
-```
-
-## Documentation
-
-Each Bicep template has its own README with architecture diagrams, deployment commands, cost estimates, and customization options.
+| Script | Description |
+|--------|-------------|
+| `create-start-script.sh` | Generate a one-command launcher for Azure VMs |
+| `destroy-project.sh` | Safely destroy Azure resource groups with confirmation |
 
 ## License
 

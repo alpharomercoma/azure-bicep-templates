@@ -46,7 +46,7 @@ write_files:
       CPU_STATE_FILE="/var/run/autoshutdown-cpu-idle-count"
       SSH_STATE_FILE="/var/run/autoshutdown-ssh-idle-count"
 
-      # Thresholds (matching AWS CDK solution)
+      # Thresholds
       CPU_THRESHOLD=5          # CPU usage percentage threshold
       CPU_IDLE_THRESHOLD=3     # Consecutive idle checks before deallocate (3 x 5 min = 15 min)
       SSH_IDLE_THRESHOLD=2     # Consecutive idle checks before deallocate (2 x 5 min = 10 min)

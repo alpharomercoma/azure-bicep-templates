@@ -10,14 +10,14 @@ using './main.bicep'
 // Then paste the contents of ~/.ssh/azure-autoshutdown.pub below.
 // =============================================================================
 
-param location = 'southeastasia'            // Equivalent to AWS ap-southeast-1
+param location = 'southeastasia'
 param baseName = 'autoshutdown'
 param adminUsername = 'azureuser'
-param vmSize = 'Standard_B2s'               // Equivalent to AWS t4g.small
-param osDiskSizeGb = 30                     // Same as AWS (30 GiB GP3)
+param vmSize = 'Standard_B2s'
+param osDiskSizeGb = 30
 param autoShutdownTime = '2300'             // 11:00 PM daily safety net
 param autoShutdownTimezone = 'Singapore Standard Time'
-param notificationEmail = ''                // Optional: your@email.com
+param notificationEmail = ''
 
 // IMPORTANT: Replace with your SSH public key
 param sshPublicKey = readEnvironmentVariable('SSH_PUBLIC_KEY', '')
