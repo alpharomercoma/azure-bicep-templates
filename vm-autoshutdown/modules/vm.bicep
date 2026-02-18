@@ -33,6 +33,10 @@ param autoShutdownTimezone string = 'Singapore Standard Time'
 @description('Cloud-init custom data (base64 encoded)')
 param cloudInitData string
 
+// Virtual Machine Contributor role definition ID.
+// Scope is restricted to this VM resource only.
+var vmContributorRoleId = '9980e02c-c2be-4d73-94e8-173b1dc7cf3c'
+
 // =============================================================================
 // Virtual Machine
 // =============================================================================
@@ -109,6 +113,21 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-03-01' = {
         enabled: true
       }
     }
+  }
+}
+
+// =============================================================================
+// Role Assignment: VM Contributor for Self-Deallocate
+// =============================================================================
+// Grants the VM's managed identity only VM-scoped permissions needed for
+// self-deallocate operations.
+resource vmContributorRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: vm
+  name: guid(vm.id, vmContributorRoleId)
+  properties: {
+    principalId: vm.identity.principalId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', vmContributorRoleId)
+    principalType: 'ServicePrincipal'
   }
 }
 

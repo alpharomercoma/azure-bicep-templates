@@ -62,10 +62,6 @@ param notificationEmail string = ''
 // Variables
 // =============================================================================
 
-// Virtual Machine Contributor role definition ID
-// Allows the VM's managed identity to deallocate itself
-var vmContributorRoleId = '9980e02c-c2be-4d73-94e8-173b1dc7cf3c'
-
 // Load cloud-init configuration from file
 var cloudInitData = base64(loadTextContent('scripts/cloud-init.yaml'))
 
@@ -96,23 +92,6 @@ module vm 'modules/vm.bicep' = {
     autoShutdownTime: autoShutdownTime
     autoShutdownTimezone: autoShutdownTimezone
     cloudInitData: cloudInitData
-  }
-}
-
-// =============================================================================
-// Role Assignment: VM Contributor for Self-Deallocate
-// =============================================================================
-// Grants the VM's system-assigned managed identity the Virtual Machine
-// Contributor role, scoped to the resource group. This allows the cloud-init
-// script to call the Azure REST API to deallocate the VM when idle.
-//
-
-resource vmContributorRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(resourceGroup().id, baseName, vmContributorRoleId)
-  properties: {
-    principalId: vm.outputs.vmPrincipalId
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', vmContributorRoleId)
-    principalType: 'ServicePrincipal'
   }
 }
 

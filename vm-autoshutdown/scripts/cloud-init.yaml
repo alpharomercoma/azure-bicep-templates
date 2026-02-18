@@ -262,7 +262,7 @@ write_files:
 
         echo "$(date): Deallocate API response: HTTP $RESPONSE" >> "$LOG_FILE"
 
-        if [ "$RESPONSE" != "202" ]; then
+        if [[ ! "$RESPONSE" =~ ^2[0-9][0-9]$ ]]; then
           echo "$(date): WARNING - Deallocate API returned $RESPONSE. Falling back to OS shutdown." >> "$LOG_FILE"
           /sbin/shutdown -h now "Auto-shutdown: $REASON"
         else
