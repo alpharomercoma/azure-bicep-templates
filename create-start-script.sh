@@ -51,14 +51,29 @@ RG="${RG}"
 VM_NAME="${VM_NAME}"
 SSH_KEY="${SSH_KEY}"
 SSH_USER="${SSH_USER}"
+SSH_CONFIG="\${HOME}/.ssh/config"
+SSH_HOST_ALIAS="azure-${VM_NAME}"
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "\$1" "\$2" -u low -t 3000
+  fi
+}
 
 echo "Checking VM state..."
 STATE=\$(az vm get-instance-view --resource-group "\$RG" --name "\$VM_NAME" \
-  --query 'instanceView.statuses[1].displayStatus' -o tsv 2>/dev/null)
+  --query "instanceView.statuses[?starts_with(code, 'PowerState/')].displayStatus | [0]" -o tsv 2>/dev/null)
 
 if [[ "\$STATE" == *"deallocated"* ]] || [[ "\$STATE" == *"stopped"* ]]; then
   echo "Starting VM \$VM_NAME..."
+  notify "Azure Dev Box" "Waking up VM..."
   az vm start --resource-group "\$RG" --name "\$VM_NAME"
+  while true; do
+    STATE=\$(az vm get-instance-view --resource-group "\$RG" --name "\$VM_NAME" \
+      --query "instanceView.statuses[?starts_with(code, 'PowerState/')].displayStatus | [0]" -o tsv 2>/dev/null || true)
+    [[ "\$STATE" == *"running"* ]] && break
+    sleep 5
+  done
 elif [[ "\$STATE" == *"running"* ]]; then
   echo "VM already running."
 else
@@ -68,7 +83,24 @@ fi
 
 IP=\$(az vm show --resource-group "\$RG" --name "\$VM_NAME" --show-details \
   --query publicIps -o tsv)
-echo "Public IP: \$IP"
+echo "VM is up at: \$IP"
+
+mkdir -p "\$(dirname "\$SSH_CONFIG")"
+touch "\$SSH_CONFIG"
+if grep -q "# AZURE_DEV_BOX_START \${SSH_HOST_ALIAS}" "\$SSH_CONFIG"; then
+  sed -i "/# AZURE_DEV_BOX_START \${SSH_HOST_ALIAS}/,/# AZURE_DEV_BOX_END \${SSH_HOST_ALIAS}/ s/HostName .*/HostName \$IP/" "\$SSH_CONFIG"
+else
+  cat >> "\$SSH_CONFIG" <<EOF
+# AZURE_DEV_BOX_START \${SSH_HOST_ALIAS}
+Host \${SSH_HOST_ALIAS}
+  HostName \$IP
+  User \$SSH_USER
+  IdentityFile \$SSH_KEY
+# AZURE_DEV_BOX_END \${SSH_HOST_ALIAS}
+EOF
+fi
+echo "SSH config updated for host alias: \$SSH_HOST_ALIAS"
+notify "Azure Dev Box Ready" "VM is UP at \$IP. SSH config updated."
 
 echo "Connecting via SSH..."
 ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=accept-new "\$SSH_USER@\$IP"
