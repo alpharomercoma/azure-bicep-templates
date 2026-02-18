@@ -58,6 +58,9 @@ param autoShutdownTimezone string = 'Singapore Standard Time'
 @description('Email address for CPU idle alert notifications (leave empty to skip)')
 param notificationEmail string = ''
 
+@description('CIDR allowed to SSH into the VM (for example x.x.x.x/32)')
+param allowedSshCidr string = '127.0.0.1/32'
+
 // =============================================================================
 // Variables
 // =============================================================================
@@ -73,6 +76,7 @@ module network 'modules/network.bicep' = {
   params: {
     location: location
     baseName: baseName
+    allowedSshCidr: allowedSshCidr
   }
 }
 
@@ -138,3 +142,6 @@ output resourceGroupName string = resourceGroup().name
 
 @description('Deployment region')
 output region string = location
+
+@description('CIDR allowed to SSH into the VM')
+output sshAllowedCidr string = allowedSshCidr

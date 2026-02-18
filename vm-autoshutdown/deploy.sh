@@ -24,6 +24,14 @@ RESOURCE_GROUP="${RESOURCE_GROUP:-autoshutdown-rg}"
 LOCATION="${LOCATION:-southeastasia}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-$HOME/.ssh/azure-autoshutdown.pub}"
 VM_SIZE="${VM_SIZE:-Standard_B2s}"
+DEFAULT_SSH_CIDR="127.0.0.1/32"
+if command -v curl &> /dev/null; then
+    DETECTED_IP="$(curl -fsS https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$DETECTED_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        DEFAULT_SSH_CIDR="${DETECTED_IP}/32"
+    fi
+fi
+ALLOWED_SSH_CIDR="${ALLOWED_SSH_CIDR:-$DEFAULT_SSH_CIDR}"
 DEPLOYMENT_NAME="autoshutdown-$(date +%Y%m%d-%H%M%S)"
 
 # Colors
@@ -106,6 +114,7 @@ validate() {
                 sshPublicKey="$SSH_KEY" \
                 location="$LOCATION" \
                 vmSize="$VM_SIZE" \
+                allowedSshCidr="$ALLOWED_SSH_CIDR" \
             --no-prompt &> /dev/null; then
             log_ok "Azure deployment validation passed"
         else
@@ -116,7 +125,8 @@ validate() {
                 --parameters \
                     sshPublicKey="$SSH_KEY" \
                     location="$LOCATION" \
-                    vmSize="$VM_SIZE" 2>&1
+                    vmSize="$VM_SIZE" \
+                    allowedSshCidr="$ALLOWED_SSH_CIDR" 2>&1
         fi
     else
         log_warn "Resource group '$RESOURCE_GROUP' does not exist. Skipping deployment validation."
@@ -139,7 +149,8 @@ what_if() {
         --parameters \
             sshPublicKey="$SSH_KEY" \
             location="$LOCATION" \
-            vmSize="$VM_SIZE"
+            vmSize="$VM_SIZE" \
+            allowedSshCidr="$ALLOWED_SSH_CIDR"
 }
 
 # =============================================================================
@@ -151,6 +162,7 @@ deploy() {
     echo "  Resource Group: $RESOURCE_GROUP"
     echo "  Location:       $LOCATION"
     echo "  VM Size:        $VM_SIZE"
+    echo "  SSH CIDR:       $ALLOWED_SSH_CIDR"
     echo "  SSH Key:        $SSH_KEY_PATH"
     echo "  Deployment:     $DEPLOYMENT_NAME"
     echo ""
@@ -172,6 +184,7 @@ deploy() {
             sshPublicKey="$SSH_KEY" \
             location="$LOCATION" \
             vmSize="$VM_SIZE" \
+            allowedSshCidr="$ALLOWED_SSH_CIDR" \
         --query 'properties.outputs' \
         --output json 2>&1); then
 
@@ -260,6 +273,7 @@ case "${1:-deploy}" in
         echo "  RESOURCE_GROUP  Resource group name (default: autoshutdown-rg)"
         echo "  LOCATION        Azure region (default: southeastasia)"
         echo "  VM_SIZE         VM size (default: Standard_B2s)"
+        echo "  ALLOWED_SSH_CIDR SSH ingress CIDR (default: auto-detected public IP/32)"
         echo "  SSH_KEY_PATH    Path to SSH public key (default: ~/.ssh/azure-autoshutdown.pub)"
         ;;
     *)

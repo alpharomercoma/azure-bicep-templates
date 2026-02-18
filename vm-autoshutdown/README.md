@@ -66,7 +66,10 @@ cd vm-autoshutdown
 | `RESOURCE_GROUP` | `autoshutdown-rg` | Resource group name |
 | `LOCATION` | `southeastasia` | Azure region |
 | `VM_SIZE` | `Standard_B2s` | VM size |
+| `ALLOWED_SSH_CIDR` | `<your-public-ip>/32` (auto-detected by `deploy.sh`) | CIDR allowed to access SSH |
 | `SSH_KEY_PATH` | `~/.ssh/azure-autoshutdown.pub` | SSH public key path |
+
+If `ALLOWED_SSH_CIDR` is not set and auto-detection fails, SSH is locked down to `127.0.0.1/32`.
 
 ## Connect
 

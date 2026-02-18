@@ -14,6 +14,9 @@ param vnetAddressPrefix string = '10.0.0.0/16'
 @description('Subnet address prefix')
 param subnetAddressPrefix string = '10.0.1.0/24'
 
+@description('CIDR allowed to SSH into the VM (for example x.x.x.x/32)')
+param allowedSshCidr string = '127.0.0.1/32'
+
 // =============================================================================
 // Network Security Group
 // =============================================================================
@@ -31,7 +34,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-01-01' = {
           protocol: 'Tcp'
           sourcePortRange: '*'
           destinationPortRange: '22'
-          sourceAddressPrefix: '*'
+          sourceAddressPrefix: allowedSshCidr
           destinationAddressPrefix: '*'
         }
       }

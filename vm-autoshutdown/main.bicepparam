@@ -18,6 +18,7 @@ param osDiskSizeGb = 30
 param autoShutdownTime = '2300'             // 11:00 PM daily safety net
 param autoShutdownTimezone = 'Singapore Standard Time'
 param notificationEmail = ''
+param allowedSshCidr = readEnvironmentVariable('ALLOWED_SSH_CIDR', '127.0.0.1/32')
 
 // IMPORTANT: Replace with your SSH public key
 param sshPublicKey = readEnvironmentVariable('SSH_PUBLIC_KEY', '')
