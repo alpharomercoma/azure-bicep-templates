@@ -3,15 +3,21 @@
 // =============================================================================
 //
 // This Bicep template deploys an Azure VM with automatic shutdown based on
-// inactivity detection, using a dual-method approach:
+// inactivity detection, using a multi-signal quorum approach:
 //
 // 1. CPU Monitoring (Primary):
 //    - Checks CPU utilization every 5 minutes
 //    - Deallocates VM after 3 consecutive idle checks (15 min, CPU < 5%)
 //
-// 2. SSH Session Detection (Secondary):
+// 2. SSH Session Detection:
 //    - Checks for active SSH sessions every 5 minutes
-//    - Deallocates VM after 2 consecutive idle checks (10 min, 0 sessions)
+//    - Requires no active sessions for 2 consecutive checks (10 min)
+// 3. Network Throughput Detection:
+//    - Requires low combined inbound/outbound throughput for 3 checks (15 min)
+// 4. Disk I/O Detection:
+//    - Requires near-zero read/write IOPS and throughput for 3 checks (15 min)
+// 5. Decision Rule:
+//    - Deallocate when SSH is idle and at least 2 of 3 workload signals are idle
 // =============================================================================
 
 targetScope = 'resourceGroup'

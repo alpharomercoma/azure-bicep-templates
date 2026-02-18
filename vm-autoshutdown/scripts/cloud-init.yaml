@@ -2,16 +2,22 @@
 # =============================================================================
 # Azure VM Auto-Shutdown Cloud-Init Configuration
 # =============================================================================
-# This cloud-init config implements dual-method inactivity detection:
+# This cloud-init config implements multi-signal inactivity detection:
 #
 # 1. CPU Monitoring (Primary Method):
 #    - Checks CPU utilization every 5 minutes
 #    - Deallocates VM after 3 consecutive idle checks (15 min total)
 #    - CPU threshold: < 5% average utilization
 #
-# 2. SSH Session Detection (Secondary Method):
+# 2. SSH Session Detection:
 #    - Checks for active SSH sessions every 5 minutes
 #    - Deallocates VM after 2 consecutive idle checks (10 min total)
+# 3. Network Throughput Detection:
+#    - Checks inbound + outbound throughput every 5 minutes
+#    - Counts idle when throughput is below threshold
+# 4. Disk I/O Detection:
+#    - Checks read/write IOPS and throughput every 5 minutes
+#    - Counts idle when both are near zero
 #
 # Both methods use Azure REST API via Managed Identity to deallocate
 # the VM (stops compute billing), not just OS shutdown.
@@ -34,30 +40,48 @@ write_files:
       # ========================================================================
       # Azure VM Auto-Shutdown: Idle Detection & Self-Deallocate
       # ========================================================================
-      # This script checks for VM inactivity using two methods:
-      # 1. CPU utilization (< 5% for 15 minutes)
-      # 2. SSH sessions (none for 10 minutes)
+      # This script checks VM inactivity using multiple signals:
+      # 1. CPU utilization
+      # 2. SSH sessions
+      # 3. Network throughput (inbound + outbound)
+      # 4. Disk I/O (IOPS + throughput)
       #
-      # When idle, it deallocates the VM via Azure REST API using the VM's
+      # Decision model:
+      #   - No active SSH sessions for threshold duration, and
+      #   - At least 2 of 3 workload signals are idle (CPU/Network/Disk)
+      #
+      # When considered idle, it deallocates the VM via Azure REST API using the VM's
       # system-assigned managed identity, ensuring compute billing stops.
       # ========================================================================
 
       LOG_FILE="/var/log/autoshutdown.log"
       CPU_STATE_FILE="/var/run/autoshutdown-cpu-idle-count"
       SSH_STATE_FILE="/var/run/autoshutdown-ssh-idle-count"
+      NET_STATE_FILE="/var/run/autoshutdown-net-idle-count"
+      DISK_STATE_FILE="/var/run/autoshutdown-disk-idle-count"
 
       # Thresholds
-      CPU_THRESHOLD=5          # CPU usage percentage threshold
-      CPU_IDLE_THRESHOLD=3     # Consecutive idle checks before deallocate (3 x 5 min = 15 min)
-      SSH_IDLE_THRESHOLD=2     # Consecutive idle checks before deallocate (2 x 5 min = 10 min)
+      CPU_THRESHOLD=5                    # CPU usage percentage threshold
+      CPU_IDLE_THRESHOLD=3               # 3 x 5 min = 15 min
+      SSH_IDLE_THRESHOLD=2               # 2 x 5 min = 10 min
+      NET_KBPS_THRESHOLD=20              # Combined RX+TX throughput threshold (KB/s)
+      NET_IDLE_THRESHOLD=3               # 3 x 5 min = 15 min
+      DISK_IOPS_THRESHOLD=2              # Combined read+write IOPS threshold
+      DISK_KBPS_THRESHOLD=10             # Combined read+write throughput threshold (KB/s)
+      DISK_IDLE_THRESHOLD=3              # 3 x 5 min = 15 min
+      WORKLOAD_IDLE_SIGNALS_REQUIRED=2   # Require 2 of 3 workload signals (CPU/NET/DISK)
 
       # Initialize state files if not exist
       [ ! -f "$CPU_STATE_FILE" ] && echo "0" > "$CPU_STATE_FILE"
       [ ! -f "$SSH_STATE_FILE" ] && echo "0" > "$SSH_STATE_FILE"
+      [ ! -f "$NET_STATE_FILE" ] && echo "0" > "$NET_STATE_FILE"
+      [ ! -f "$DISK_STATE_FILE" ] && echo "0" > "$DISK_STATE_FILE"
 
       # Read current idle counts
       CPU_IDLE_COUNT=$(cat "$CPU_STATE_FILE")
       SSH_IDLE_COUNT=$(cat "$SSH_STATE_FILE")
+      NET_IDLE_COUNT=$(cat "$NET_STATE_FILE")
+      DISK_IDLE_COUNT=$(cat "$DISK_STATE_FILE")
 
       # ======================================================================
       # CPU Utilization Check
@@ -116,19 +140,93 @@ write_files:
       fi
 
       # ======================================================================
+      # Network Throughput Check (combined inbound + outbound)
+      # ======================================================================
+      NET_IFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+      if [ -z "$NET_IFACE" ]; then
+        NET_IFACE=$(ls /sys/class/net 2>/dev/null | grep -E -v '^(lo|docker|br-|veth)' | head -1)
+      fi
+
+      NET_KBPS="0"
+      if [ -n "$NET_IFACE" ] && [ -r "/sys/class/net/$NET_IFACE/statistics/rx_bytes" ] && [ -r "/sys/class/net/$NET_IFACE/statistics/tx_bytes" ]; then
+        RX1=$(cat "/sys/class/net/$NET_IFACE/statistics/rx_bytes")
+        TX1=$(cat "/sys/class/net/$NET_IFACE/statistics/tx_bytes")
+        sleep 5
+        RX2=$(cat "/sys/class/net/$NET_IFACE/statistics/rx_bytes")
+        TX2=$(cat "/sys/class/net/$NET_IFACE/statistics/tx_bytes")
+
+        RX_DIFF=$((RX2 - RX1))
+        TX_DIFF=$((TX2 - TX1))
+        TOTAL_BYTES=$((RX_DIFF + TX_DIFF))
+        NET_KBPS=$(echo "scale=2; $TOTAL_BYTES / 1024 / 5" | bc 2>/dev/null || echo "0")
+      fi
+
+      echo "$(date): Network throughput (${NET_IFACE:-unknown}): ${NET_KBPS} KB/s" >> "$LOG_FILE"
+
+      IS_NET_IDLE=$(echo "$NET_KBPS < $NET_KBPS_THRESHOLD" | bc -l 2>/dev/null || echo "0")
+      if [ "$IS_NET_IDLE" -eq 1 ]; then
+        NET_IDLE_COUNT=$((NET_IDLE_COUNT + 1))
+        echo "$NET_IDLE_COUNT" > "$NET_STATE_FILE"
+        echo "$(date): Network idle. Count incremented to $NET_IDLE_COUNT/$NET_IDLE_THRESHOLD" >> "$LOG_FILE"
+      else
+        echo "0" > "$NET_STATE_FILE"
+        NET_IDLE_COUNT=0
+        echo "$(date): Network active. Idle count reset." >> "$LOG_FILE"
+      fi
+
+      # ======================================================================
+      # Disk I/O Check (combined read/write throughput + IOPS)
+      # ======================================================================
+      read -r DISK_IO1 DISK_SECTORS1 <<< "$(awk '$3 !~ /^(loop|ram|fd|sr|dm-|md)/ {io += $4 + $8; sectors += $6 + $10} END {print io + 0, sectors + 0}' /proc/diskstats)"
+      sleep 5
+      read -r DISK_IO2 DISK_SECTORS2 <<< "$(awk '$3 !~ /^(loop|ram|fd|sr|dm-|md)/ {io += $4 + $8; sectors += $6 + $10} END {print io + 0, sectors + 0}' /proc/diskstats)"
+
+      DISK_IO_DIFF=$((DISK_IO2 - DISK_IO1))
+      DISK_SECTORS_DIFF=$((DISK_SECTORS2 - DISK_SECTORS1))
+      DISK_IOPS=$(echo "scale=2; $DISK_IO_DIFF / 5" | bc 2>/dev/null || echo "0")
+      DISK_KBPS=$(echo "scale=2; ($DISK_SECTORS_DIFF * 512) / 1024 / 5" | bc 2>/dev/null || echo "0")
+
+      echo "$(date): Disk activity: ${DISK_IOPS} IOPS, ${DISK_KBPS} KB/s" >> "$LOG_FILE"
+
+      IS_DISK_IDLE_IOPS=$(echo "$DISK_IOPS < $DISK_IOPS_THRESHOLD" | bc -l 2>/dev/null || echo "0")
+      IS_DISK_IDLE_KBPS=$(echo "$DISK_KBPS < $DISK_KBPS_THRESHOLD" | bc -l 2>/dev/null || echo "0")
+
+      if [ "$IS_DISK_IDLE_IOPS" -eq 1 ] && [ "$IS_DISK_IDLE_KBPS" -eq 1 ]; then
+        DISK_IDLE_COUNT=$((DISK_IDLE_COUNT + 1))
+        echo "$DISK_IDLE_COUNT" > "$DISK_STATE_FILE"
+        echo "$(date): Disk idle. Count incremented to $DISK_IDLE_COUNT/$DISK_IDLE_THRESHOLD" >> "$LOG_FILE"
+      else
+        echo "0" > "$DISK_STATE_FILE"
+        DISK_IDLE_COUNT=0
+        echo "$(date): Disk active. Idle count reset." >> "$LOG_FILE"
+      fi
+
+      # ======================================================================
       # Deallocate Decision
       # ======================================================================
       SHOULD_DEALLOCATE=0
       REASON=""
+      WORKLOAD_IDLE_SIGNALS=0
+      WORKLOAD_REASON=""
 
       if [ "$CPU_IDLE_COUNT" -ge "$CPU_IDLE_THRESHOLD" ]; then
-        SHOULD_DEALLOCATE=1
-        REASON="CPU idle for $((CPU_IDLE_COUNT * 5)) minutes (threshold: $((CPU_IDLE_THRESHOLD * 5)) min)"
+        WORKLOAD_IDLE_SIGNALS=$((WORKLOAD_IDLE_SIGNALS + 1))
+        WORKLOAD_REASON="${WORKLOAD_REASON:+$WORKLOAD_REASON; }CPU idle for $((CPU_IDLE_COUNT * 5)) minutes"
       fi
 
-      if [ "$SSH_IDLE_COUNT" -ge "$SSH_IDLE_THRESHOLD" ]; then
+      if [ "$NET_IDLE_COUNT" -ge "$NET_IDLE_THRESHOLD" ]; then
+        WORKLOAD_IDLE_SIGNALS=$((WORKLOAD_IDLE_SIGNALS + 1))
+        WORKLOAD_REASON="${WORKLOAD_REASON:+$WORKLOAD_REASON; }Network throughput below ${NET_KBPS_THRESHOLD} KB/s for $((NET_IDLE_COUNT * 5)) minutes"
+      fi
+
+      if [ "$DISK_IDLE_COUNT" -ge "$DISK_IDLE_THRESHOLD" ]; then
+        WORKLOAD_IDLE_SIGNALS=$((WORKLOAD_IDLE_SIGNALS + 1))
+        WORKLOAD_REASON="${WORKLOAD_REASON:+$WORKLOAD_REASON; }Disk I/O near zero for $((DISK_IDLE_COUNT * 5)) minutes"
+      fi
+
+      if [ "$SSH_IDLE_COUNT" -ge "$SSH_IDLE_THRESHOLD" ] && [ "$WORKLOAD_IDLE_SIGNALS" -ge "$WORKLOAD_IDLE_SIGNALS_REQUIRED" ]; then
         SHOULD_DEALLOCATE=1
-        REASON="${REASON:+$REASON; }No SSH sessions for $((SSH_IDLE_COUNT * 5)) minutes (threshold: $((SSH_IDLE_THRESHOLD * 5)) min)"
+        REASON="No SSH sessions for $((SSH_IDLE_COUNT * 5)) minutes; Workload idle signals: $WORKLOAD_IDLE_SIGNALS/3 (${WORKLOAD_REASON})"
       fi
 
       if [ "$SHOULD_DEALLOCATE" -eq 1 ]; then
@@ -209,6 +307,9 @@ runcmd:
   - 'echo "$(date): Auto-shutdown monitoring initialized" > /var/log/autoshutdown.log'
   - 'echo "$(date): CPU threshold < 5% for 15 minutes (3 checks)" >> /var/log/autoshutdown.log'
   - 'echo "$(date): SSH threshold 0 sessions for 10 minutes (2 checks)" >> /var/log/autoshutdown.log'
+  - 'echo "$(date): Network threshold < 20 KB/s for 15 minutes (3 checks)" >> /var/log/autoshutdown.log'
+  - 'echo "$(date): Disk threshold < 2 IOPS and < 10 KB/s for 15 minutes (3 checks)" >> /var/log/autoshutdown.log'
+  - 'echo "$(date): Decision = SSH idle AND at least 2 of 3 workload signals idle (CPU/Network/Disk)" >> /var/log/autoshutdown.log'
   - 'echo "$(date): Check interval 5 minutes" >> /var/log/autoshutdown.log'
   - 'echo "$(date): Grace period 10 minutes after boot" >> /var/log/autoshutdown.log'
   - 'echo "$(date): Action - Deallocate via Azure REST API (stops billing)" >> /var/log/autoshutdown.log'

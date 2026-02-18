@@ -14,13 +14,17 @@ Azure VM with automatic shutdown on inactivity detection.
 
 ## Auto-Shutdown
 
-### CPU Monitoring (Primary — Cloud-Init)
+### Multi-Signal Idle Detection (Cloud-Init)
 
-Systemd timer checks CPU utilization every 5 minutes via `mpstat`. After 3 consecutive idle checks (15 minutes, CPU < 5%), the VM self-deallocates via Azure REST API using its managed identity.
+Systemd timer checks these signals every 5 minutes:
+- CPU utilization via `mpstat` (`< 5%`, 15 minutes)
+- SSH sessions via `who` (`0 sessions`, 10 minutes)
+- Network throughput (`RX+TX < 20 KB/s`, 15 minutes)
+- Disk I/O (`< 2 IOPS` and `< 10 KB/s`, 15 minutes)
 
-### SSH Session Detection (Secondary — Cloud-Init)
-
-Same systemd timer checks for active SSH sessions via `who`. After 2 consecutive idle checks (10 minutes), the VM self-deallocates.
+Deallocation decision uses a quorum model:
+- `SSH idle` **AND**
+- at least `2 of 3` workload signals idle (`CPU`, `Network`, `Disk`)
 
 ### DevTest Lab Schedule (Safety Net)
 
@@ -37,8 +41,10 @@ Resource Group
 ├── VM (Standard_B2s, Ubuntu 24.04)
 │   ├── Managed Identity → Azure REST API (self-deallocate)
 │   └── Cloud-Init (systemd timer, 5 min)
-│       ├── CPU Monitor (< 5%, 15 min → deallocate)
-│       └── SSH Detection (0 sessions, 10 min → deallocate)
+│       ├── CPU Monitor (< 5%, 15 min)
+│       ├── SSH Detection (0 sessions, 10 min)
+│       ├── Network Monitor (RX+TX < 20 KB/s, 15 min)
+│       └── Disk I/O Monitor (< 2 IOPS and < 10 KB/s, 15 min)
 ├── Azure Monitor Metric Alert (CPU < 5%, 15 min)
 └── DevTest Lab Schedule (daily 11 PM)
 ```

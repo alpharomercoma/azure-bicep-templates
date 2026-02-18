@@ -6,7 +6,7 @@ Azure infrastructure templates using Bicep.
 
 ### [vm-autoshutdown](./vm-autoshutdown)
 
-Azure VM with automatic shutdown on inactivity (CPU monitoring + SSH session detection + DevTest Lab schedule).
+Azure VM with automatic shutdown on inactivity (multi-signal quorum: CPU + SSH + network + disk + DevTest Lab schedule).
 
 | Property | Value |
 |----------|-------|
